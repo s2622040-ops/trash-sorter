@@ -8,12 +8,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from sentence_transformers import SentenceTransformer
 from google.cloud import vision
 from google.cloud import translate_v2 as translate
+import os 
+import requests
+from dotenv import load_dotenv
+from pydantic import BaseModel
+from collections import Counter
 
-# ファイルパス（本番で必要なものだけ残す）
+
+# Yahoo!ショッピングWebAPIから取得したYahoo Client IDを持ってくる
+load_dotenv()
+YAHOO_CLIENT_ID = os.getenv("YAHOO_CLIENT_ID")
+
+# ファイルパス
 TRANS_CACHE_JSON = Path("translation_cache.json")
 KOTO_CSV = Path("131083_028_garbage_separation.csv")
 COLORS_CSV = Path("colors.csv")
 C01_CSV = Path("C01.csv")
+BARCODE_CACHE_JSON = Path("barcode_cache.json")
+
+INVALID_BRANDS = {"", "-", "ブランド登録なし", "ノーブランド"}
 
 MATERIAL_LABELS = {
     "paper": "紙類", "paper product": "紙類", "cardboard": "段ボール・厚紙",
@@ -80,6 +93,7 @@ async def lifespan(app: FastAPI):
     state["ng_embeddings"] = model.encode(NG_CONCEPT_ANCHORS, normalize_embeddings=True) # NGベクトル
     state["exclude_words"] = load_exclusion_sets() # 除外ワード
     state["trans_cache"] = load_json(TRANS_CACHE_JSON) # 翻訳キャッシュ
+    state["barcode_cache"] = load_json(BARCODE_CACHE_JSON) # バーコード&GS1キャッシュ
     # 起動準備完了、サーバーの受付開始
     print("サーバー準備完了！")
     yield
@@ -93,6 +107,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Flutterから受け取るJSONの形を定義(バーコード用)
+class BarcodeRequest(BaseModel):
+    jan_code: str
+
+class BarcodeConfirmRequest(BaseModel):
+    jan_code: str
+    brand: str
+    product_name: str # キャッシュJSON・CSVでの確認用
+
 
 # 画像解析
 def detect_labels_vision_bytes(content: bytes):
@@ -149,6 +173,8 @@ def translate_missing_tags(tags):
             trans_cache[en] = res["translatedText"]
         # サーバー再起動時も使えるようにtranslation_cache.jsonに保存
         save_json(TRANS_CACHE_JSON, trans_cache)
+
+
 # 共有ボックス(state)からモデル、江東区DBを取り出し、英語・日本語の両ベクトルで類似度を計算、平均化。スコアが高い上位3件の品目・分別区分・備考・類似度を返す
 def search_koto_rules_hybrid(query_en, query_ja, top_k=3):
     model = state["model"]
@@ -180,6 +206,132 @@ def extract_parts_alerts(memo):
     if "30cm" in memo: alerts.append("⚠️ 30cm以上は粗大ごみ")
     return " / ".join(alerts) if alerts else "特になし"
 
+# Yahoo!ショッピングAPI(v3)で上位5件検索し、多数決でブランドを選ぶ
+def lookup_jan_yahoo(jan_code: str):
+    # IDが空の場合
+    if not YAHOO_CLIENT_ID:
+        raise Exception("YAHOO_CLIENT_ID が .env に設定されていません")
+    # Yahoo!商品検索WebAPIの接続先URL
+    url = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
+    # URLの後ろにつける検索条件
+    params = {
+        "appid": YAHOO_CLIENT_ID, # APIキー
+        "jan_code": jan_code, # 検索したいバーコード番号
+        "results": 5,  # 上位5件を取得
+    }
+    # Yahoo!に条件に沿ったリクエスト送信
+    res = requests.get(url, params=params, timeout=10)
+    # 400、500番台のエラーの場合、処理を止める
+    res.raise_for_status()
+    # 返ってきたJSONテキストをPythonの辞書データに変換する
+    data = res.json()
+
+    # 検索結果の商品一覧が0件ならNoneとする
+    hits = data.get("hits", [])
+    if not hits:
+        return None
+
+    # 上位5件から空欄を除いたブランド名を集めて最頻値を取る
+    brands = [
+        (h.get("brand") or {}).get("name", "").strip()
+        for h in hits
+        if (h.get("brand") or {}).get("name", "").strip() not in INVALID_BRANDS
+    ]
+    brand_name = Counter(brands).most_common(1)[0][0] if brands else "-"
+    product_name = hits[0].get("name", "")
+    # 最頻ブランドと確認用の商品名を1つの辞書にまとめて返す
+    return {
+        "brand": brand_name,
+        "product_name": product_name,
+    }
+# FlutterからJANコードを受け取るエンドポイント
+@app.post("/classify_barcode")
+async def classify_barcode(req: BarcodeRequest):
+    # 受け取ったバーコードの前後の空白を消して取得
+    jan = req.jan_code.strip()
+    # 数字以外が入っていたらエラー用JSONを返して終了
+    if not jan.isdigit():
+        return {
+            "status": "エラー",
+            "jan_code": jan,
+            "brand": "-",
+            "product_name": "-",
+            "message": "バーコードの形式が正しくありません",
+        }
+    # キャッシュから以下の取り出し、切り出しを行う
+    cache = state["barcode_cache"]
+    # 13桁JANコード辞書(取り出し)
+    jan_map = cache.get("jan", {})
+    # 頭7桁の企業コード辞書(取り出し)
+    gs1_map = cache.get("gs1", {})
+    # 読み込まれたコード頭7桁(切り出し)
+    gs1_prefix = jan[:7] if len(jan) >= 7 else ""
+
+    # すでにユーザーが確定済みのJANコードならキャッシュから即返却
+    if jan in jan_map:
+        saved = jan_map[jan]
+        # 過去に確定済みのデータがあるため、Yahoo!APIを呼ばずにキャッシュから即返却する
+        return {
+            "status": "キャッシュ一致（確定済）",
+            "jan_code": jan,
+            "brand": saved["brand"],
+            "product_name": saved["product_name"],
+        }
+
+    # Yahoo! APIで検索
+    try:
+        product = lookup_jan_yahoo(jan)
+    except Exception as e:
+        return {
+            "status": "APIエラー",
+            "jan_code": jan,
+            "brand": "-",
+            "product_name": "-",
+            "message": f"商品検索に失敗しました: {e}",
+        }
+
+    if not product:
+        # 商品が見つからなくてもGS1頭7桁がキャッシュにあればブランドは補完、商品未登録で返す
+        fallback_brand = gs1_map.get(gs1_prefix, "-")
+        return {
+            "status": "商品未登録",
+            "jan_code": jan,
+            "brand": fallback_brand,
+            "product_name": "該当商品なし",
+        }
+
+    # APIでブランドが空欄でも、GS1頭7桁キャッシュにあればブランド名だけ入れる
+    brand_name = product["brand"] if product["brand"] != "-" else gs1_map.get(gs1_prefix, "-")
+    # 取得した企業・ブランド名と確認用の商品名をJSON形式でFlutterで返す
+    return {
+        "status": "バーコード一致",
+        "jan_code": jan,
+        "brand": brand_name,
+        "product_name": product["product_name"],
+    }
+
+# ユーザーが「合っている」と確認したあとにキャッシュへ保存
+@app.post("/confirm_barcode")
+async def confirm_barcode(req: BarcodeConfirmRequest):
+    jan = req.jan_code.strip()
+    cache = state["barcode_cache"]
+    cache.setdefault("jan", {}) # 辞書にJANコード保存用の枠がまだ無い場合に空辞書を作成
+    cache.setdefault("gs1", {}) # 辞書にGS1保存用の枠がない場合に空辞書を作成
+
+    # JANコードごとの確定情報を保存
+    cache["jan"][jan] = {
+        "brand": req.brand,
+        "product_name": req.product_name,
+    }
+
+    # 45/49始まりかつブランド名があれば、GS1頭7桁とブランド名ペアも保存
+    if jan.startswith(("45", "49")) and len(jan) >= 7 and req.brand not in ("", "-", "ブランド登録なし", "ノーブランド"):
+        cache["gs1"][jan[:7]] = req.brand
+
+    # メモリ上の最新キャッシュをbarcode_cache.jsonに書き出して保存
+    save_json(BARCODE_CACHE_JSON, cache)
+    return {"status": "saved", "jan_code": jan, "brand": req.brand}
+
 #　Flutterから画像を受け取るエンドポイント
 @app.post("/classify")
 async def classify_garbage(file: UploadFile = File(...)):
@@ -192,7 +344,6 @@ async def classify_garbage(file: UploadFile = File(...)):
     # タグが1つも取れなければ特定不能と返す
     if not labels:
         return {"status": "特定不能（足切り）", "category": "不明", "item": "不明", "material": "不明", "brand": brand_str, "alert": "-", "memo": "-", "alternatives": [], "score": 0.0}
-
     # 未知のタグは翻訳、必要なものは共有ボックス(state)から取り出す
     translate_missing_tags(labels)
     model = state["model"]
